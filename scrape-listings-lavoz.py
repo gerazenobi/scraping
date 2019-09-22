@@ -18,6 +18,7 @@ DEFUALT_CHROME_DRIVER_PATH = os.path.join(PROJECT_DIR, "scraping", "chromedriver
 
 browser_driver_path = ""
 pages_to_fetch_queue = Queue()
+waiting_for_request_queue = Queue()
 page_contents_queue = Queue()
 apartments_list = []
 
@@ -32,9 +33,10 @@ class PageFetcher(threading.Thread):
     def run(self):
         while True:
             page = self.pages_to_fetch_queue.get()
+            waiting_for_request_queue.put(page)
             self.browser.get(page)
+            waiting_for_request_queue.get()
             content = self.browser.page_source
-            print(f"got results from page: {page}")
             self.page_contents_queue.put(content)
             self.pages_to_fetch_queue.task_done()
 
@@ -52,11 +54,28 @@ class PageConsumer(threading.Thread):
             regex_for_listing = re.compile("BoxResultado Borde Espacio")
             apartments = soup.find_all("div", attrs={"class": regex_for_listing})
             for apartment in apartments:
-                listing = process_listing(apartment)
+                listing = parse_listing(apartment)
                 if listing:
                     self.apartments_list.append(listing)
-            print("done processing page")
             self.pages_contents_queue.task_done()
+
+
+class UIProgress(threading.Thread):
+    def __init__(self, pages_to_fetch_queue, page_contents_queue):
+        super().__init__()
+        self.pages_to_fetch_queue = pages_to_fetch_queue
+        self.page_contents_queue = page_contents_queue
+
+    def run(self):
+        while True:
+            print(
+                "\r" +
+                f"Pages to fetch: [{self.pages_to_fetch_queue.qsize()}] - " +
+                f"Content to process: [{self.page_contents_queue.qsize()}] - " +
+                f"Pending requests: [{waiting_for_request_queue.qsize()}]",
+                end="",
+            )
+            time.sleep(0.1)
 
 
 def get_browser():
@@ -69,6 +88,11 @@ def get_browser():
 def scrape():
     pages = []
     start_time = time.time()
+
+    ui_thread = UIProgress(pages_to_fetch_queue, page_contents_queue)
+    ui_thread.setDaemon(True)
+    ui_thread.start()
+
     total, page_size = get_total_apartments_and_page_size()
     for i in range(round(total / page_size)):
         pages.append(URL_TO_SCRAPE + str(i))
@@ -102,7 +126,7 @@ def scrape():
     print_results_and_generate_csv(apartments_list, total, time_elapsed)
 
 
-def process_listing(apartment):
+def parse_listing(apartment):
     try:
         listing = {}
         is_owner = "particular" in apartment.find("div", attrs={"class": "avatar"}).text.lower()
@@ -122,7 +146,7 @@ def process_listing(apartment):
             return None
         price = float(price.replace("$", "").replace(".", "").replace(",", ".").strip())
         if price < 5000 or price > 30000:  # acceptable limits ?
-            print(f"price not acceptable for listing that passed validation: {url}")
+            # print(f"price not acceptable for listing that passed validation: {url}") # TODO: debug logging
             return None
 
         listing["price"] = price
@@ -151,6 +175,7 @@ def get_total_apartments_and_page_size():
 
 
 def print_results_and_generate_csv(results, total_number_of_apartments, elapsed_time_in_minutes):
+    # TODO: refactor
     prices = [listing["price"] for listing in results]
     published_by_owner_prices = [listing["price"] for listing in results if listing["is_owner"]]
     published_by_agency_prices = [listing["price"] for listing in results if not listing["is_owner"]]
