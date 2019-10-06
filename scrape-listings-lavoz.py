@@ -1,10 +1,8 @@
 import argparse
 import csv
-import os
 import re
 import threading
 import time
-from os.path import dirname, realpath
 from queue import Queue
 
 import numpy
@@ -13,10 +11,7 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
 URL_TO_SCRAPE = "https://clasificados.lavoz.com.ar/search/apachesolr_search/?f[0]=im_taxonomy_vid_34:6330&f[1]=im_taxonomy_vid_34:6334&f[2]=ss_operacion:Alquileres&f[3]=ss_cantidad_dormitorios:1%20Dormitorio&f[4]=im_taxonomy_vid_5:5034&page="
-PROJECT_DIR = dirname(dirname(realpath(__file__)))
-DEFUALT_CHROME_DRIVER_PATH = os.path.join(PROJECT_DIR, "scraping", "chromedriver")
-
-browser_driver_path = ""
+browser_driver_path = None
 pages_to_fetch_queue = Queue()
 waiting_for_request_queue = Queue()
 page_contents_queue = Queue()
@@ -36,8 +31,8 @@ class PageFetcher(threading.Thread):
             waiting_for_request_queue.put(page)
             self.browser.get(page)
             waiting_for_request_queue.get()
-            content = self.browser.page_source
-            self.page_contents_queue.put(content)
+            waiting_for_request_queue.task_done()
+            self.page_contents_queue.put(self.browser.page_source)
             self.pages_to_fetch_queue.task_done()
 
 
@@ -80,9 +75,12 @@ class UIProgress(threading.Thread):
 
 def get_browser():
     chrome_options = Options()
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-gpu')
     chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--window-size=1024x1400")
-    return webdriver.Chrome(chrome_options=chrome_options, executable_path=browser_driver_path)
+    if browser_driver_path:
+        return webdriver.Chrome(chrome_options=chrome_options, executable_path=browser_driver_path)
+    return webdriver.Chrome(chrome_options=chrome_options)
 
 
 def scrape():
@@ -101,17 +99,16 @@ def scrape():
     for i in range(8):
         browser = get_browser()
         browsers.append(browser)
-        t = PageFetcher(pages_to_fetch_queue, page_contents_queue, browser)
-        t.setDaemon(True)
-        t.start()
+        fetcher = PageFetcher(pages_to_fetch_queue, page_contents_queue, browser)
+        fetcher.setDaemon(True)
+        fetcher.start()
 
     for host in pages:
         pages_to_fetch_queue.put(host)
 
-    for i in range(2):
-        dt = PageConsumer(page_contents_queue, apartments_list)
-        dt.setDaemon(True)
-        dt.start()
+    consumer = PageConsumer(page_contents_queue, apartments_list)
+    consumer.setDaemon(True)
+    consumer.start()
 
     pages_to_fetch_queue.join()
     page_contents_queue.join()
@@ -238,7 +235,7 @@ def print_results_and_generate_csv(results, total_number_of_apartments, elapsed_
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--chrome-driver-path", default=DEFUALT_CHROME_DRIVER_PATH)
+    parser.add_argument("--chrome-driver-path", default=None)
     args, _ = parser.parse_known_args()
     browser_driver_path = args.chrome_driver_path
     scrape()

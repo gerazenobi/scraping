@@ -1,0 +1,10 @@
+version: '3'
+services:
+  scraper:
+    image: scraper
+    build: .
+    shm_size: 1gb
+    stdin_open: true
+    tty: true
+    volumes:
+      - .:/scraper
