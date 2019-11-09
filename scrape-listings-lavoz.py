@@ -64,10 +64,10 @@ class UIProgress(threading.Thread):
     def run(self):
         while True:
             print(
-                "\r" +
-                f"Pages to fetch: [{self.pages_to_fetch_queue.qsize()}] - " +
-                f"Content to process: [{self.page_contents_queue.qsize()}] - " +
-                f"Pending requests: [{waiting_for_request_queue.qsize()}]",
+                "\r"
+                + f"Pages to fetch: [{self.pages_to_fetch_queue.qsize()}] - "
+                + f"Content to process: [{self.page_contents_queue.qsize()}] - "
+                + f"Pending requests: [{waiting_for_request_queue.qsize()}]",
                 end="",
             )
             time.sleep(0.1)
@@ -75,8 +75,8 @@ class UIProgress(threading.Thread):
 
 def get_browser():
     chrome_options = Options()
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--headless")
     if browser_driver_path:
         return webdriver.Chrome(chrome_options=chrome_options, executable_path=browser_driver_path)
@@ -207,7 +207,7 @@ def print_results_and_generate_csv(results, total_number_of_apartments, elapsed_
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         for listing in results:
-            listing_id, = re.search(r"departamentos/(\d+)/", listing["url"]).groups()
+            (listing_id,) = re.search(r"departamentos/(\d+)/", listing["url"]).groups()
             writer.writerow(
                 {
                     "id": listing_id,
