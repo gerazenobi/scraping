@@ -8,7 +8,7 @@
 ### Run
 - `python <scraper_name>.py --chrome-driver-path=/path/to/driver`
 
-Note: the scraper uses `webdriver.Chrome` in order to overcome getting bloqued by certain websites; that said you are welcome to change this and use your preferred browser and corresponding driver.
+Note: some scrapers use `webdriver.Chrome` in order to overcome getting blocked by certain websites; that said you are welcome to change this and use your preferred browser and corresponding driver.
 ```python
 from selenium.webdriver.chrome.options import Options
 
@@ -27,6 +27,7 @@ If no driver path is provided it assumes the path to find the driver is present 
 ### Available scrapers
 
 - **scrape-listings-lavoz.py** : will scrape 1 dorm non seasonal apartments from clasificados.lavoz.com.ar and produce a csv file containing information about each apartment and a histogram for prices distribution.
+- **scrape-listings-mercadolibre.py** : will scrape 1 dorm non seasonal apartments from mercadolibre.com.ar and produce a csv file containing information about each apartment and a histogram for prices distribution.
 
 ### Running scrapers with docker
 Alternatively you can choose to run the scraper in a ready to use image provided.

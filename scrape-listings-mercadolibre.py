@@ -1,5 +1,5 @@
-import argparse
 import csv
+import math
 import re
 import threading
 import time
@@ -7,34 +7,33 @@ from queue import Queue
 import statistics
 
 import numpy
+import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 
-URL_TO_SCRAPE = "https://clasificados.lavoz.com.ar/search/apachesolr_search/?f[0]=im_taxonomy_vid_34:6330&f[1]=im_taxonomy_vid_34:6334&f[2]=ss_operacion:Alquileres&f[3]=ss_cantidad_dormitorios:1%20Dormitorio&f[4]=im_taxonomy_vid_5:5034&page="
-browser_driver_path = None
+AGENCIES_URL_TO_SCRAPE = "https://inmuebles.mercadolibre.com.ar/departamentos/alquiler/1-dormitorio/cordoba/cordoba/inmobiliaria/nueva-cordoba/_Desde_"
+OWNERS_URL_TO_SCRAPE = "https://inmuebles.mercadolibre.com.ar/departamentos/alquiler/1-dormitorio/cordoba/cordoba/dueno-directo/nueva-cordoba/_Desde_"
 pages_to_fetch_queue = Queue()
 waiting_for_request_queue = Queue()
 page_contents_queue = Queue()
 apartments_list = []
-csv_file_name = "1-bedroom-rents-nueva-cordoba.csv"
+csv_file_name = "1-bedroom-rents-nueva-cordoba-mercado-libre.csv"
 
 
 class PageFetcher(threading.Thread):
-    def __init__(self, pages_to_fetch_queue, page_contents_queue, browser):
+    def __init__(self, pages_to_fetch_queue, page_contents_queue, session):
         super().__init__()
         self.pages_to_fetch_queue = pages_to_fetch_queue
         self.page_contents_queue = page_contents_queue
-        self.browser = browser
+        self.session = session
 
     def run(self):
         while True:
             page = self.pages_to_fetch_queue.get()
             waiting_for_request_queue.put(page)
-            self.browser.get(page)
+            response = self.session.get(page)
             waiting_for_request_queue.get()
             waiting_for_request_queue.task_done()
-            self.page_contents_queue.put(self.browser.page_source)
+            self.page_contents_queue.put(response.text)
             self.pages_to_fetch_queue.task_done()
 
 
@@ -48,10 +47,9 @@ class PageConsumer(threading.Thread):
         while True:
             content = self.pages_contents_queue.get()
             soup = BeautifulSoup(content, "html.parser")
-            regex_for_listing = re.compile("BoxResultado Borde Espacio")
-            apartments = soup.find_all("div", attrs={"class": regex_for_listing})
+            apartments = soup.find_all("li", attrs={"class": "results-item highlighted article grid"})
             for apartment in apartments:
-                listing = parse_listing(apartment)
+                listing = parse_listing(apartment, is_owner="dueño directo" in soup.title.text)
                 if listing:
                     self.apartments_list.append(listing)
             self.pages_contents_queue.task_done()
@@ -75,16 +73,6 @@ class UIProgress(threading.Thread):
             time.sleep(0.1)
 
 
-def get_browser():
-    chrome_options = Options()
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--headless")
-    if browser_driver_path:
-        return webdriver.Chrome(chrome_options=chrome_options, executable_path=browser_driver_path)
-    return webdriver.Chrome(chrome_options=chrome_options)
-
-
 def scrape():
     pages = []
     start_time = time.time()
@@ -93,20 +81,30 @@ def scrape():
     ui_thread.setDaemon(True)
     ui_thread.start()
 
-    total, page_size = get_total_apartments_and_page_size()
-    for i in range(round(total / page_size)):
-        pages.append(URL_TO_SCRAPE + str(i))
-    browsers = []
+    total_for_agencies, page_size_for_agencies = get_total_apartments_and_page_size(AGENCIES_URL_TO_SCRAPE)
+    total_for_owners, page_size_for_owners = get_total_apartments_and_page_size(OWNERS_URL_TO_SCRAPE)
+    increment = 1
+    number_of_pages_agencies = math.ceil(total_for_agencies / page_size_for_agencies)
+    for _ in range(number_of_pages_agencies):
+        pages.append(AGENCIES_URL_TO_SCRAPE + str(increment))
+        increment += page_size_for_agencies
 
-    for i in range(8):
-        browser = get_browser()
-        browsers.append(browser)
-        fetcher = PageFetcher(pages_to_fetch_queue, page_contents_queue, browser)
+    number_of_owners = math.ceil(total_for_owners / page_size_for_owners)
+    increment = 1
+    for _ in range(number_of_owners):
+        pages.append(OWNERS_URL_TO_SCRAPE + str(increment))
+        increment += page_size_for_agencies
+    sessions = []
+
+    for i in range(5):
+        session = requests.session()
+        sessions.append(session)
+        fetcher = PageFetcher(pages_to_fetch_queue, page_contents_queue, session)
         fetcher.setDaemon(True)
         fetcher.start()
 
-    for host in pages:
-        pages_to_fetch_queue.put(host)
+    for url in pages:
+        pages_to_fetch_queue.put(url)
 
     consumer = PageConsumer(page_contents_queue, apartments_list)
     consumer.setDaemon(True)
@@ -115,39 +113,25 @@ def scrape():
     pages_to_fetch_queue.join()
     page_contents_queue.join()
 
-    for browser in browsers:
-        browser.quit()
+    for session in sessions:
+        session.close()
 
     time_elapsed = (time.time() - start_time) / 60
-    print(f"finished in {time_elapsed}")
+    print(f"Finished in {time_elapsed}")
     print(f"Apartments: {len(apartments_list)}")
 
-    print_results_and_generate_csv(apartments_list, total, time_elapsed)
+    print_results_and_generate_csv(apartments_list, total_for_agencies + total_for_owners, time_elapsed)
 
 
-def parse_listing(apartment):
+def parse_listing(apartment, is_owner):
     try:
         listing = {}
-        is_owner = "particular" in apartment.find("div", attrs={"class": "avatar"}).text.lower()
-        price = apartment.find("div", attrs={"class": "cifra"}).text
-        description = apartment.find("div", attrs={"class": "Descripcion"}).text.lower()
-        title = apartment.find("h4").text.lower()
-        sub_title = apartment.find("h2") or apartment.find("h3") or apartment.find("h5")
-        sub_title = sub_title.text.lower()
+        price = int(apartment.find("span", attrs={"class": "price__fraction"}).text.replace(".", ""))
         url = apartment.find("a").attrs["href"]
-        titles_and_desc = sub_title + " " + title + " " + description
-        if "consultar" in price or "U$S" in price:
-            return None
-        if re.search(
-            r"inversiones|inversión|amueblado|amoblado|amoblados|venta|vendo|temporal|temporario|temporada",
-            titles_and_desc,
-        ):
-            return None
-        price = float(price.replace("$", "").replace(".", "").replace(",", ".").strip())
         if price < 5000 or price > 30000:  # acceptable limits ?
-            # print(f"price not acceptable for listing that passed validation: {url}") # TODO: debug logging
+            print(f"price not acceptable for listing that passed validation: {url}")  # TODO: debug logging
             return None
-
+        listing["title"] = apartment.find("div", attrs={"class": "item__title"}).text
         listing["price"] = price
         listing["is_owner"] = is_owner
         listing["url"] = url
@@ -156,20 +140,16 @@ def parse_listing(apartment):
         raise identifier
 
 
-def get_total_apartments_and_page_size():
+def get_total_apartments_and_page_size(url):
     """
     Returns (total_number_of_aparments, page_size)
     """
-    browser = get_browser()
-    browser.get(URL_TO_SCRAPE + str(0))
-    content = browser.page_source
-    soup = BeautifulSoup(content, "html.parser")
-    results_text = soup.find("p", attrs={"class": "cantidadResultados"}).text
-    results_number_regex = re.compile(".+\((\d+) .+\)")
+    page = requests.get(url + "1").text
+    soup = BeautifulSoup(page, "html.parser")
+    results_text = soup.find("div", attrs={"class": "quantity-results"}).text
+    results_number_regex = re.compile(" (\d+) .+")
     total_number_of_apartments = int(results_number_regex.match(results_text).group(1))
-    regex_for_listing = re.compile("BoxResultado Borde Espacio")
-    apartments = soup.find_all("div", attrs={"class": regex_for_listing})
-    browser.quit()
+    apartments = soup.find_all("li", attrs={"class": "results-item highlighted article grid"})
     return total_number_of_apartments, len(apartments)
 
 
@@ -179,7 +159,7 @@ def print_results_and_generate_csv(results, total_number_of_apartments, elapsed_
     published_by_owner_prices = [listing["price"] for listing in results if listing["is_owner"]]
     published_by_agency_prices = [listing["price"] for listing in results if not listing["is_owner"]]
     print("\n===============================================")
-    print(f"Finished scraping la voz listings in {elapsed_time_in_minutes} minutes")
+    print(f"Finished scraping mercadolibre listings {elapsed_time_in_minutes} minutes")
     print(f"Total scraped apartments: {total_number_of_apartments}")
     print(f"Relevant apartments processed: {len(results)}")
     print(f"Ignored apartments: {total_number_of_apartments - len(results)}")
@@ -213,7 +193,7 @@ def print_results_and_generate_csv(results, total_number_of_apartments, elapsed_
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
         for listing in results:
-            (listing_id,) = re.search(r"departamentos/(\d+)/", listing["url"]).groups()
+            listing_id = listing["title"]
             writer.writerow(
                 {
                     "id": listing_id,
@@ -239,8 +219,4 @@ def print_results_and_generate_csv(results, total_number_of_apartments, elapsed_
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--chrome-driver-path", default=None)
-    args, _ = parser.parse_known_args()
-    browser_driver_path = args.chrome_driver_path
     scrape()
