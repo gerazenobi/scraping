@@ -11,7 +11,8 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
-URL_TO_SCRAPE = "https://clasificados.lavoz.com.ar/search/apachesolr_search/?f[0]=im_taxonomy_vid_34:6330&f[1]=im_taxonomy_vid_34:6334&f[2]=ss_operacion:Alquileres&f[3]=ss_cantidad_dormitorios:1%20Dormitorio&f[4]=im_taxonomy_vid_5:5034&page="
+URL_TO_SCRAPE_AGENCIES = "https://clasificados.lavoz.com.ar/inmuebles/departamentos/nueva-cordoba/1-dormitorio?ciudad=cordoba&provincia=cordoba&operacion=alquileres&cantidad-de-dormitorios[1]=1-dormitorio&tipo-de-vendedor=inmobiliaria"
+URL_TO_SCRAPE_OWNERS = "https://clasificados.lavoz.com.ar/inmuebles/departamentos/nueva-cordoba/1-dormitorio?ciudad=cordoba&provincia=cordoba&operacion=alquileres&cantidad-de-dormitorios[1]=1-dormitorio&tipo-de-vendedor=particular"
 browser_driver_path = None
 pages_to_fetch_queue = Queue()
 waiting_for_request_queue = Queue()
@@ -48,10 +49,16 @@ class PageConsumer(threading.Thread):
         while True:
             content = self.pages_contents_queue.get()
             soup = BeautifulSoup(content, "html.parser")
-            regex_for_listing = re.compile("BoxResultado Borde Espacio")
-            apartments = soup.find_all("div", attrs={"class": regex_for_listing})
+            apartments = soup.find_all(
+                "div", attrs={"class": "col-6 flex flex-wrap content-start sm-col-3 md-col-3 align-top"}
+            )
+            filters = [
+                e.text.replace(" ×", "").strip()
+                for e in soup.find_all("a", attrs={"class": "inline-flex btn btn-outline-main m0 p03"})
+            ]
+            is_owner = "Particular" in filters
             for apartment in apartments:
-                listing = parse_listing(apartment)
+                listing = parse_listing(apartment, is_owner)
                 if listing:
                     self.apartments_list.append(listing)
             self.pages_contents_queue.task_done()
@@ -93,9 +100,13 @@ def scrape():
     ui_thread.setDaemon(True)
     ui_thread.start()
 
-    total, page_size = get_total_apartments_and_page_size()
-    for i in range(round(total / page_size)):
-        pages.append(URL_TO_SCRAPE + str(i))
+    total_agencies, _, last_page = get_total_apartments_and_page_size(URL_TO_SCRAPE_AGENCIES)
+    for i in range(1, last_page + 1):
+        pages.append(URL_TO_SCRAPE_AGENCIES + f"&page={str(i)}")
+
+    total_owners, _, last_page = get_total_apartments_and_page_size(URL_TO_SCRAPE_OWNERS)
+    for i in range(1, last_page + 1):
+        pages.append(URL_TO_SCRAPE_OWNERS + f"&page={str(i)}")
     browsers = []
 
     for i in range(8):
@@ -122,29 +133,24 @@ def scrape():
     print(f"finished in {time_elapsed}")
     print(f"Apartments: {len(apartments_list)}")
 
-    print_results_and_generate_csv(apartments_list, total, time_elapsed)
+    print_results_and_generate_csv(apartments_list, total_agencies + total_owners, time_elapsed)
 
 
-def parse_listing(apartment):
+def parse_listing(apartment, is_owner):
     try:
         listing = {}
-        is_owner = "particular" in apartment.find("div", attrs={"class": "avatar"}).text.lower()
-        price = apartment.find("div", attrs={"class": "cifra"}).text
-        description = apartment.find("div", attrs={"class": "Descripcion"}).text.lower()
-        title = apartment.find("h4").text.lower()
-        sub_title = apartment.find("h2") or apartment.find("h3") or apartment.find("h5")
-        sub_title = sub_title.text.lower()
+        price = apartment.find("span", attrs={"class": "price"}).text
+        title = apartment.find("h2").text.lower()
         url = apartment.find("a").attrs["href"]
-        titles_and_desc = sub_title + " " + title + " " + description
         if "consultar" in price or "U$S" in price:
             return None
         if re.search(
             r"inversiones|inversión|amueblado|amoblado|amoblados|venta|vendo|temporal|temporario|temporada",
-            titles_and_desc,
+            title,
         ):
             return None
         price = float(price.replace("$", "").replace(".", "").replace(",", ".").strip())
-        if price < 5000 or price > 30000:  # acceptable limits ?
+        if price < 10000 or price > 30000:  # acceptable limits ?
             # print(f"price not acceptable for listing that passed validation: {url}") # TODO: debug logging
             return None
 
@@ -156,21 +162,24 @@ def parse_listing(apartment):
         raise identifier
 
 
-def get_total_apartments_and_page_size():
+def get_total_apartments_and_page_size(url):
     """
-    Returns (total_number_of_aparments, page_size)
+    Returns (total_number_of_apartments, page_size)
     """
     browser = get_browser()
-    browser.get(URL_TO_SCRAPE + str(0))
+    browser.get(url)
     content = browser.page_source
     soup = BeautifulSoup(content, "html.parser")
-    results_text = soup.find("p", attrs={"class": "cantidadResultados"}).text
-    results_number_regex = re.compile(".+\((\d+) .+\)")
-    total_number_of_apartments = int(results_number_regex.match(results_text).group(1))
-    regex_for_listing = re.compile("BoxResultado Borde Espacio")
-    apartments = soup.find_all("div", attrs={"class": regex_for_listing})
+
+    results_text = soup.find("span", attrs={"class": "h4"}).text
+    results_number_regex = re.compile("[\w\s]*:\s(\d+\.?\d+)")
+    total_number_of_apartments = int(results_number_regex.match(results_text).group(1).replace(".", ""))
+    last_page = int(soup.find_all("a", attrs={"class": "page-link h4"})[-1].text)
+    per_page = len(
+        soup.find_all("div", attrs={"class": "col-6 flex flex-wrap content-start sm-col-3 md-col-3 align-top"})
+    )
     browser.quit()
-    return total_number_of_apartments, len(apartments)
+    return total_number_of_apartments, per_page, last_page
 
 
 def print_results_and_generate_csv(results, total_number_of_apartments, elapsed_time_in_minutes):
