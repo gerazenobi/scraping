@@ -10,8 +10,8 @@ import numpy
 import requests
 from bs4 import BeautifulSoup
 
-AGENCIES_URL_TO_SCRAPE = "https://inmuebles.mercadolibre.com.ar/departamentos/alquiler/1-dormitorio/cordoba/cordoba/inmobiliaria/nueva-cordoba/_Desde_"
-OWNERS_URL_TO_SCRAPE = "https://inmuebles.mercadolibre.com.ar/departamentos/alquiler/1-dormitorio/cordoba/cordoba/dueno-directo/nueva-cordoba/_Desde_"
+AGENCIES_URL_TO_SCRAPE = "https://inmuebles.mercadolibre.com.ar/departamentos/alquiler/1-dormitorio/cordoba/cordoba/nueva-cordoba-o-guemes/{}_NoIndex_True#applied_filter_id%3DBEDROOMS%26applied_filter_name%3DDormitorios%26applied_filter_order%3D8%26applied_value_id%3D%5B1-1%5D%26applied_value_name%3D1+dormitorio%26applied_value_order%3D3%26applied_value_results%3D155%26is_custom%3Dfalse"
+OWNERS_URL_TO_SCRAPE = "https://inmuebles.mercadolibre.com.ar/departamentos/alquiler/1-dormitorio/cordoba/cordoba/nueva-cordoba-o-guemes/dueno-directo/{}_NoIndex_True"
 pages_to_fetch_queue = Queue()
 waiting_for_request_queue = Queue()
 page_contents_queue = Queue()
@@ -28,12 +28,12 @@ class PageFetcher(threading.Thread):
 
     def run(self):
         while True:
-            page = self.pages_to_fetch_queue.get()
+            page, owner_info = self.pages_to_fetch_queue.get()
             waiting_for_request_queue.put(page)
             response = self.session.get(page)
             waiting_for_request_queue.get()
             waiting_for_request_queue.task_done()
-            self.page_contents_queue.put(response.text)
+            self.page_contents_queue.put((response.text, owner_info))
             self.pages_to_fetch_queue.task_done()
 
 
@@ -45,11 +45,11 @@ class PageConsumer(threading.Thread):
 
     def run(self):
         while True:
-            content = self.pages_contents_queue.get()
+            content, owner_info = self.pages_contents_queue.get()
             soup = BeautifulSoup(content, "html.parser")
-            apartments = soup.find_all("li", attrs={"class": "results-item highlighted article grid"})
+            apartments = soup.find_all("li", attrs={"class": "ui-search-layout__item"})
             for apartment in apartments:
-                listing = parse_listing(apartment, is_owner="dueño directo" in soup.title.text)
+                listing = parse_listing(apartment, is_owner=owner_info["is_owner"])
                 if listing:
                     self.apartments_list.append(listing)
             self.pages_contents_queue.task_done()
@@ -81,19 +81,47 @@ def scrape():
     ui_thread.setDaemon(True)
     ui_thread.start()
 
-    total_for_agencies, page_size_for_agencies = get_total_apartments_and_page_size(AGENCIES_URL_TO_SCRAPE)
-    total_for_owners, page_size_for_owners = get_total_apartments_and_page_size(OWNERS_URL_TO_SCRAPE)
-    increment = 1
+    total_for_agencies, page_size_for_agencies = get_total_apartments_and_page_size(
+        AGENCIES_URL_TO_SCRAPE
+    )
+    total_for_owners, page_size_for_owners = get_total_apartments_and_page_size(
+        OWNERS_URL_TO_SCRAPE
+    )
+    increment = 0
     number_of_pages_agencies = math.ceil(total_for_agencies / page_size_for_agencies)
-    for _ in range(number_of_pages_agencies):
-        pages.append(AGENCIES_URL_TO_SCRAPE + str(increment))
-        increment += page_size_for_agencies
+    if page_size_for_agencies <= number_of_pages_agencies:
+        pages.append((AGENCIES_URL_TO_SCRAPE.format(""), {"is_owner": False}))
+    else:
+        for _ in range(number_of_pages_agencies):
+            if increment == 0:
+                pages.append((AGENCIES_URL_TO_SCRAPE.format(""), {"is_owner": False}))
+                increment += page_size_for_agencies + 1
+            else:
+                pages.append(
+                    (
+                        AGENCIES_URL_TO_SCRAPE.format(f"_Desde_{increment}"),
+                        {"is_owner": False},
+                    )
+                )
+                increment += page_size_for_agencies
 
     number_of_owners = math.ceil(total_for_owners / page_size_for_owners)
-    increment = 1
-    for _ in range(number_of_owners):
-        pages.append(OWNERS_URL_TO_SCRAPE + str(increment))
-        increment += page_size_for_agencies
+    increment = 0
+    if page_size_for_owners <= number_of_owners:
+        pages.append((OWNERS_URL_TO_SCRAPE.format(""), {"is_owner": True}))
+    else:
+        for _ in range(number_of_owners):
+            if increment == 0:
+                pages.append((OWNERS_URL_TO_SCRAPE.format(""), {"is_owner": True}))
+                increment += page_size_for_owners + 1
+            else:
+                pages.append(
+                    (
+                        OWNERS_URL_TO_SCRAPE.format(f"_Desde_{increment}"),
+                        {"is_owner": True},
+                    )
+                )
+                increment += page_size_for_owners
     sessions = []
 
     for i in range(5):
@@ -103,8 +131,8 @@ def scrape():
         fetcher.setDaemon(True)
         fetcher.start()
 
-    for url in pages:
-        pages_to_fetch_queue.put(url)
+    for page_info in pages:
+        pages_to_fetch_queue.put(page_info)
 
     consumer = PageConsumer(page_contents_queue, apartments_list)
     consumer.setDaemon(True)
@@ -120,18 +148,42 @@ def scrape():
     print(f"Finished in {time_elapsed}")
     print(f"Apartments: {len(apartments_list)}")
 
-    print_results_and_generate_csv(apartments_list, total_for_agencies + total_for_owners, time_elapsed)
+    print_results_and_generate_csv(
+        apartments_list, total_for_agencies + total_for_owners, time_elapsed
+    )
 
 
 def parse_listing(apartment, is_owner):
     try:
         listing = {}
-        price = int(apartment.find("span", attrs={"class": "price__fraction"}).text.replace(".", ""))
         url = apartment.find("a").attrs["href"]
-        if price < 5000 or price > 30000:  # acceptable limits ?
-            print(f"price not acceptable for listing that passed validation: {url}")  # TODO: debug logging
+        title = apartment.find("a").text
+
+        if re.search(
+            r"inversiones|inversión|amueblado|amoblado|amoblados|venta|vendo|temporal|temporario|temporada",
+            title,
+            re.IGNORECASE,
+        ):
+            print(f"amoblado o temporal, ignorado: {url}")
             return None
-        listing["title"] = apartment.find("div", attrs={"class": "item__title"}).text
+
+        if (
+            apartment.find(
+                "span", attrs={"class": "andes-money-amount__currency-symbol"}
+            ).text
+            != "$"
+        ):
+            print(f"price not in ARS: {url}")
+            return None
+        price = int(
+            apartment.find(
+                "span", attrs={"class": "andes-money-amount__fraction"}
+            ).text.replace(".", "")
+        )
+        if price < 100000 or price > 1000000:  # acceptable limits ?
+            print(f"price not acceptable for listing that passed validation: {url}")
+            return None
+        listing["title"] = title
         listing["price"] = price
         listing["is_owner"] = is_owner
         listing["url"] = url
@@ -144,20 +196,29 @@ def get_total_apartments_and_page_size(url):
     """
     Returns (total_number_of_aparments, page_size)
     """
-    page = requests.get(url + "1").text
+    page = requests.get(url.format("")).text
     soup = BeautifulSoup(page, "html.parser")
-    results_text = soup.find("div", attrs={"class": "quantity-results"}).text
-    results_number_regex = re.compile(" (\d+) .+")
+    results_text = soup.find(
+        "span", attrs={"class": "ui-search-search-result__quantity-results"}
+    ).text
+    results_number_regex = re.compile("(\d+) resultados")
     total_number_of_apartments = int(results_number_regex.match(results_text).group(1))
-    apartments = soup.find_all("li", attrs={"class": "results-item highlighted article grid"})
+    apartments = soup.find_all("li", attrs={"class": "ui-search-layout__item"})
     return total_number_of_apartments, len(apartments)
 
 
-def print_results_and_generate_csv(results, total_number_of_apartments, elapsed_time_in_minutes):
+def print_results_and_generate_csv(
+    results, total_number_of_apartments, elapsed_time_in_minutes
+):
     # TODO: refactor
     prices = [listing["price"] for listing in results]
-    published_by_owner_prices = [listing["price"] for listing in results if listing["is_owner"]]
-    published_by_agency_prices = [listing["price"] for listing in results if not listing["is_owner"]]
+    published_by_owner_prices = [
+        listing["price"] for listing in results if listing["is_owner"]
+    ]
+    published_by_agency_prices = [
+        listing["price"] for listing in results if not listing["is_owner"]
+    ]
+    PERCENTILE = 80
     print("\n===============================================")
     print(f"Finished scraping mercadolibre listings {elapsed_time_in_minutes} minutes")
     print(f"Total scraped apartments: {total_number_of_apartments}")
@@ -171,20 +232,48 @@ def print_results_and_generate_csv(results, total_number_of_apartments, elapsed_
     print(f"AVG price: {sum(prices) / len(prices)}")
     print(f"MEDIAN price: {statistics.median(prices)}")
 
+    prices.sort()
+    index = round(len(prices) * (PERCENTILE / 100))
+    index = index if index < len(prices) else len(prices) - 1
+    percentile = prices[index]
+    print(f"{PERCENTILE}% PERCENTILE: {percentile}")
+
     print("===============================================")
     print("Owners:")
     print(f"Total: {len(published_by_owner_prices)}")
     print(f"Max price: {max(published_by_owner_prices)}")
     print(f"Min price: {min(published_by_owner_prices)}")
-    print(f"AVG price: {sum(published_by_owner_prices) / len(published_by_owner_prices)}")
+    print(
+        f"AVG price: {sum(published_by_owner_prices) / len(published_by_owner_prices)}"
+    )
     print(f"MEDIAN price: {statistics.median(published_by_owner_prices)}")
+    published_by_owner_prices.sort()
+    index = round(len(published_by_owner_prices) * (PERCENTILE / 100))
+    index = (
+        index
+        if index < len(published_by_owner_prices)
+        else len(published_by_owner_prices) - 1
+    )
+    percentile = published_by_owner_prices[index]
+    print(f"{PERCENTILE}% PERCENTILE: {percentile}")
     print("===============================================")
     print("Agencies:")
     print(f"Total: {len(published_by_agency_prices)}")
     print(f"Max price: {max(published_by_agency_prices)}")
     print(f"Min price: {min(published_by_agency_prices)}")
-    print(f"AVG price: {sum(published_by_agency_prices) / len(published_by_agency_prices)}")
+    print(
+        f"AVG price: {sum(published_by_agency_prices) / len(published_by_agency_prices)}"
+    )
     print(f"MEDIAN price: {statistics.median(published_by_agency_prices)}")
+    published_by_agency_prices.sort()
+    index = round(len(published_by_agency_prices) * (PERCENTILE / 100))
+    index = (
+        index
+        if index < len(published_by_agency_prices)
+        else len(published_by_agency_prices) - 1
+    )
+    percentile = published_by_agency_prices[index]
+    print(f"{PERCENTILE}% PERCENTILE: {percentile}")
     print("===============================================")
 
     print("\nExporting to CSV... ")
@@ -203,9 +292,14 @@ def print_results_and_generate_csv(results, total_number_of_apartments, elapsed_
                 }
             )
     # calculate histogram values to see distribution of prices
-    last_bucket = round(max(prices) / 1000) * 1000
-    bins = [value for value in range(0, last_bucket + 1000, 1000)]
+    bucket_size = 50000
+    first_bucket = math.floor(min(prices) / bucket_size) * bucket_size
+    last_bucket = math.ceil(max(prices) / bucket_size) * bucket_size
+    bins = [
+        value for value in range(first_bucket, last_bucket + bucket_size, bucket_size)
+    ]
     values, buckets = numpy.histogram(prices, bins=bins)
+
     with open(csv_file_name, "a") as csvfile:
         fieldnames = ["alquiler", "departamentos"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -213,7 +307,12 @@ def print_results_and_generate_csv(results, total_number_of_apartments, elapsed_
         print("\nPrices distribution:")
         print("========================")
         for index, value in enumerate(values):
-            writer.writerow({"alquiler": str(buckets[index]) + " - " + str(buckets[index + 1]), "departamentos": value})
+            writer.writerow(
+                {
+                    "alquiler": str(buckets[index]) + " - " + str(buckets[index + 1]),
+                    "departamentos": value,
+                }
+            )
             print(f"{str(buckets[index])} - {str(buckets[index + 1])} => {str(value)}")
     print("========================\n")
 
